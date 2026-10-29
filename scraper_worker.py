@@ -7,22 +7,25 @@ import traceback
 import subprocess
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
 from scraper_playwright import scrape_kurs
 
 
 def ensure_chromium_installed():
-    """Install Chromium if its executable is missing."""
-    with sync_playwright() as p:
-        browser_path = Path(p.chromium.executable_path)
+    """Ensure the Playwright Chromium browser is available."""
+    print("Memeriksa instalasi Chromium...", flush=True)
 
-    if not browser_path.exists():
-        print("Chromium belum tersedia. Menginstal browser...", flush=True)
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=True
-        )
-        print("Instalasi Chromium selesai.", flush=True)
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "playwright",
+            "install",
+            "chromium",
+        ],
+        check=True,
+    )
+
+    print("Chromium siap digunakan.", flush=True)
 
 
 def main():
@@ -31,7 +34,7 @@ def main():
     parser.add_argument(
         "--headless",
         choices=["true", "false"],
-        default="false"
+        default="false",
     )
     args = parser.parse_args()
 
@@ -47,12 +50,19 @@ def main():
 
         target = Path(args.output)
         target.parent.mkdir(parents=True, exist_ok=True)
+
         target.write_text(
             json.dumps(
                 {"tanggal": tanggal, "records": records},
-                ensure_ascii=False
+                ensure_ascii=False,
             ),
-            encoding="utf-8"
+            encoding="utf-8",
+        )
+
+        print(
+            f"Berhasil mengambil {len(records)} data kurs "
+            f"untuk tanggal {tanggal}.",
+            flush=True,
         )
 
     except Exception:
