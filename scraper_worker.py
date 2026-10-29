@@ -41,9 +41,7 @@ def main():
     try:
         ensure_chromium_installed()
 
-        tanggal, records = scrape_kurs(
-            headless=(args.headless == "true")
-        )
+       tanggal, records = scrape_kurs(headless=True)
 
         if not records:
             raise ValueError("BI tidak mengembalikan baris kurs.")
