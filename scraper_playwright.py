@@ -1,30 +1,29 @@
-
-"""Scraper Kurs Transaksi Bank Indonesia untuk Streamlit Cloud."""
+"""Scraper tabel Kurs Transaksi BI menggunakan Chromium Playwright."""
 
 import os
 import re
+import subprocess
+import sys
 import time
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, Error as PlaywrightError
+from playwright.sync_api import (
+    Error as PlaywrightError,
+    sync_playwright,
+)
 
 
-# =========================================================
-# KONFIGURASI
-# =========================================================
-
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 BI_URL = os.getenv(
     "BI_URL",
-    "https://www.bi.go.id/id/statistik/informasi-kurs/transaksi-bi/default.aspx",
+    "https://www.bi.go.id/id/statistik/informasi-kurs/"
+    "transaksi-bi/default.aspx",
 )
-
-TIMEOUT_MS = int(os.getenv("SCRAPE_TIMEOUT_MS", "60000"))
-MAX_RETRIES = 3
 
 MONTHS = {
     "januari": 1,
@@ -43,7 +42,6 @@ MONTHS = {
     "feb": 2,
     "mar": 3,
     "apr": 4,
-    "mei": 5,
     "jun": 6,
     "jul": 7,
     "agu": 8,
@@ -55,19 +53,12 @@ MONTHS = {
 }
 
 
-# =========================================================
-# PARSING TANGGAL
-# =========================================================
-
 def parse_date(value: str) -> str:
-    """Mengubah tanggal sumber menjadi format YYYY-MM-DD."""
-
     value = re.sub(r"\s+", " ", str(value or "").strip())
 
     match = re.search(
         r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
         value,
-        flags=re.IGNORECASE,
     )
 
     if match:
@@ -85,51 +76,42 @@ def parse_date(value: str) -> str:
         try:
             return datetime.strptime(value, fmt).date().isoformat()
         except ValueError:
-            continue
+            pass
 
     raise ValueError(
-        f"Tanggal sumber tidak dikenali: {value!r}. "
-        "Data tidak disimpan untuk mencegah tanggal yang salah."
+        f"Tanggal sumber belum dikenali: {value!r}. "
+        "Penyimpanan dibatalkan untuk mencegah tanggal salah."
     )
 
 
-# =========================================================
-# PARSING ANGKA KURS
-# =========================================================
-
 def parse_decimal(value: str) -> float:
-    """Mengubah angka dengan format Indonesia menjadi float."""
-
-    value = re.sub(r"\s+", "", str(value or ""))
+    """Konversi format Indonesia: 16.500,25 menjadi 16500.25."""
+    value = re.sub(r"\s+", "", str(value))
     value = value.replace("Rp", "")
-    value = value.replace(".", "")
-    value = value.replace(",", ".")
+    value = value.replace(".", "").replace(",", ".")
 
     try:
         number = Decimal(value)
-    except (InvalidOperation, ValueError) as error:
+
+        if not number.is_finite():
+            raise ValueError(f"Angka kurs tidak valid: {value}")
+
+        return float(number)
+
+    except InvalidOperation as exc:
         raise ValueError(
-            f"Angka kurs tidak valid: {value!r}"
-        ) from error
+            f"Angka kurs tidak valid: {value}"
+        ) from exc
 
-    if not number.is_finite():
-        raise ValueError(f"Angka kurs tidak valid: {value!r}")
-
-    return float(number)
-
-
-# =========================================================
-# MEMBACA TANGGAL SUMBER BI
-# =========================================================
 
 def extract_source_date(page) -> str:
-    """Mengambil tanggal pembaruan dari halaman BI."""
-
     body_text = page.locator("body").inner_text()
 
     patterns = [
-        r"Update\s+Terakhir\s*:?\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
-        r"(?:Kurs\s+Tanggal|Tanggal)\s*:?\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+        r"Update\s+Terakhir\s*:?\s*"
+        r"(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+        r"(?:Tanggal|Kurs\s+Tanggal)\s*:?\s*"
+        r"(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
     ]
 
     for pattern in patterns:
@@ -143,162 +125,101 @@ def extract_source_date(page) -> str:
             return parse_date(match.group(1))
 
     raise ValueError(
-        "Tanggal kurs tidak ditemukan pada halaman BI. "
-        "Format halaman mungkin telah berubah."
+        "Tanggal kurs tidak ditemukan pada halaman. "
+        "Periksa tampilan halaman BI sebelum menyimpan."
     )
 
 
-# =========================================================
-# MEMBUKA WEBSITE BI DENGAN RETRY
-# =========================================================
+def ensure_chromium(playwright):
+    """Download Chromium Playwright jika belum tersedia."""
+    executable = Path(playwright.chromium.executable_path)
 
-def open_bi_page(page) -> None:
-    """Membuka halaman BI dan mencoba ulang jika gagal."""
+    if executable.is_file():
+        return
 
-    last_error = None
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "playwright",
+            "install",
+            "chromium",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    if result.returncode != 0:
+        detail = (
+            result.stderr
+            or result.stdout
+            or "Tidak ada detail instalasi."
+        ).strip()
+
+        raise RuntimeError(
+            f"Instalasi Chromium gagal:\n{detail[-3000:]}"
+        )
+
+    if not executable.is_file():
+        raise RuntimeError(
+            "Executable Chromium belum ditemukan di: "
+            f"{executable}"
+        )
+
+
+def open_bi_page(page, timeout_ms: int):
+    """Coba kembali maksimal 3 kali jika koneksi di-reset."""
+    for attempt in range(3):
         try:
-            print(
-                f"Membuka website BI, percobaan "
-                f"{attempt}/{MAX_RETRIES}...",
-                flush=True,
-            )
-
-            page.goto(
+            response = page.goto(
                 BI_URL,
                 wait_until="domcontentloaded",
-                timeout=TIMEOUT_MS,
+                timeout=timeout_ms,
             )
 
-            page.get_by_text(
-                "USD",
-                exact=True,
-            ).last.wait_for(
-                state="visible",
-                timeout=15000,
-            )
-
-            print("Halaman BI berhasil dibuka.", flush=True)
-            return
-
-        except PlaywrightError as error:
-            last_error = error
-
-            print(
-                f"Gagal mengakses halaman BI: {error}",
-                flush=True,
-            )
-
-            if attempt < MAX_RETRIES:
-                time.sleep(3 * attempt)
-
-    raise RuntimeError(
-        "Website BI gagal diakses setelah "
-        f"{MAX_RETRIES} percobaan. "
-        "Periksa koneksi Streamlit Cloud atau akses website BI."
-    ) from last_error
-
-
-# =========================================================
-# MEMBACA TABEL KURS
-# =========================================================
-
-def extract_kurs_records(page, tanggal: str) -> list[dict]:
-    """Membaca tabel kurs jual, kurs beli, dan nilai."""
-
-    records = []
-    tables = page.locator("table")
-
-    for i in range(tables.count()):
-        table = tables.nth(i)
-        header_text = table.inner_text().lower()
-
-        required_headers = (
-            "mata uang",
-            "kurs jual",
-            "kurs beli",
-        )
-
-        if not all(
-            header in header_text
-            for header in required_headers
-        ):
-            continue
-
-        rows = table.locator("tr")
-
-        for j in range(rows.count()):
-            cells = rows.nth(j).locator("td")
-
-            if cells.count() < 4:
-                continue
-
-            values = [
-                cells.nth(k).inner_text().strip()
-                for k in range(4)
-            ]
-
-            currency = values[0].upper()
-
-            if not re.fullmatch(r"[A-Z]{3}", currency):
-                continue
-
-            try:
-                record = {
-                    "tanggal": tanggal,
-                    "mata_uang": currency,
-                    "nilai": parse_decimal(values[1]),
-                    "kurs_jual": parse_decimal(values[2]),
-                    "kurs_beli": parse_decimal(values[3]),
-                    "sumber": BI_URL,
-                }
-
-                if (
-                    record["nilai"] > 0
-                    and record["kurs_jual"] > 0
-                    and record["kurs_beli"] > 0
-                ):
-                    records.append(record)
-
-            except ValueError as error:
-                print(
-                    f"Baris {currency} dilewati: {error}",
-                    flush=True,
+            if response is not None and response.status >= 400:
+                raise RuntimeError(
+                    f"Halaman BI mengembalikan HTTP {response.status}."
                 )
 
-        if records:
-            break
+            return
 
-    # Hilangkan duplikat berdasarkan kode mata uang
-    unique_records = {
-        record["mata_uang"]: record
-        for record in records
-    }
+        except PlaywrightError as exc:
+            if "ERR_CONNECTION_RESET" not in str(exc):
+                raise
 
-    return list(unique_records.values())
+            if attempt == 2:
+                raise RuntimeError(
+                    "Koneksi dari server aplikasi ke BI diputus "
+                    "setelah 3 percobaan (ERR_CONNECTION_RESET). "
+                    "Retry tidak berhasil memulihkan koneksi."
+                ) from exc
+
+            time.sleep(3)
 
 
-# =========================================================
-# FUNGSI UTAMA SCRAPER
-# =========================================================
+def scrape_kurs(
+    headless: bool = True,
+) -> tuple[str, list[dict]]:
+    """Ambil snapshot tabel saat ini, bukan histori otomatis."""
+    timeout_ms = int(
+        os.getenv("SCRAPE_TIMEOUT_MS", "60000")
+    )
 
-def scrape_kurs(headless: bool = True) -> tuple[str, list[dict]]:
-    """
-    Mengambil data kurs yang sedang ditampilkan pada halaman BI.
+    with sync_playwright() as p:
+        ensure_chromium(p)
 
-    Mengembalikan:
-        tanggal: tanggal sumber dalam format YYYY-MM-DD
-        records: daftar data kurs per mata uang
-    """
-
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
+        # Selalu headless agar dapat berjalan di Streamlit Cloud.
+        # Parameter fungsi tetap tersedia agar kompatibel dengan worker.
+        browser = p.chromium.launch(
             headless=headless,
+            timeout=timeout_ms,
         )
 
         try:
-            context = browser.new_context(
+            page = browser.new_page(
                 locale="id-ID",
                 viewport={
                     "width": 1440,
@@ -306,48 +227,112 @@ def scrape_kurs(headless: bool = True) -> tuple[str, list[dict]]:
                 },
             )
 
-            page = context.new_page()
-            page.set_default_timeout(TIMEOUT_MS)
+            page.set_default_timeout(timeout_ms)
 
-            # Buka halaman dan coba ulang jika koneksi gagal
-            open_bi_page(page)
+            open_bi_page(page, timeout_ms)
 
-            # Pastikan tanggal berasal dari halaman BI
-            tanggal = extract_source_date(page)
-
-            print(
-                f"Tanggal sumber BI: {tanggal}",
-                flush=True,
+            page.get_by_text(
+                "USD",
+                exact=True,
+            ).last.wait_for(
+                state="visible",
+                timeout=timeout_ms,
             )
 
-            # Ambil data kurs
-            records = extract_kurs_records(page, tanggal)
+            tanggal = extract_source_date(page)
+            records = []
+
+            tables = page.locator("table")
+
+            for i in range(tables.count()):
+                table = tables.nth(i)
+
+                headers = re.sub(
+                    r"\s+",
+                    " ",
+                    table.inner_text().lower(),
+                )
+
+                required_headers = (
+                    "mata uang",
+                    "kurs jual",
+                    "kurs beli",
+                )
+
+                if not all(
+                    header in headers
+                    for header in required_headers
+                ):
+                    continue
+
+                rows = table.locator("tr")
+
+                for j in range(rows.count()):
+                    cells = rows.nth(j).locator("td")
+
+                    if cells.count() < 4:
+                        continue
+
+                    values = [
+                        cells.nth(k).inner_text().strip()
+                        for k in range(4)
+                    ]
+
+                    currency = values[0].upper()
+
+                    if not re.fullmatch(r"[A-Z]{3}", currency):
+                        continue
+
+                    try:
+                        record = {
+                            "tanggal": tanggal,
+                            "mata_uang": currency,
+                            "nilai": parse_decimal(values[1]),
+                            "kurs_jual": parse_decimal(values[2]),
+                            "kurs_beli": parse_decimal(values[3]),
+                            "sumber": BI_URL,
+                        }
+
+                        if all(
+                            record[column] > 0
+                            for column in (
+                                "nilai",
+                                "kurs_jual",
+                                "kurs_beli",
+                            )
+                        ):
+                            records.append(record)
+
+                    except ValueError:
+                        continue
+
+                if records:
+                    break
 
             if not records:
-                diagnostic_path = Path("data/debug_bi.html")
-                diagnostic_path.parent.mkdir(
+                diagnostic = BASE_DIR / "data" / "debug_bi.html"
+
+                diagnostic.parent.mkdir(
                     parents=True,
                     exist_ok=True,
                 )
 
-                diagnostic_path.write_text(
+                diagnostic.write_text(
                     page.content(),
                     encoding="utf-8",
                 )
 
                 raise RuntimeError(
                     "Tabel kurs tidak terbaca. "
-                    "Halaman diagnostik disimpan di "
-                    "data/debug_bi.html."
+                    f"HTML diagnostik: {diagnostic}"
                 )
 
-            print(
-                f"Berhasil mengambil {len(records)} "
-                f"mata uang untuk tanggal {tanggal}.",
-                flush=True,
-            )
+            unique = {
+                record["mata_uang"]: record
+                for record in records
+            }
 
-            return tanggal, records
+            return tanggal, list(unique.values())
 
         finally:
             browser.close()
