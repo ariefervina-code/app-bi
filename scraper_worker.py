@@ -34,7 +34,7 @@ def main():
     parser.add_argument(
         "--headless",
         choices=["true", "false"],
-        default="false",
+        default="true",
     )
     args = parser.parse_args()
 
